@@ -1,0 +1,425 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>STMP Tools</title>
+  <style>
+    body {
+      font-family: Arial, sans-serif;
+      margin: 20px;
+      color: #222;
+    }
+
+    h1 {
+      margin-bottom: 8px;
+    }
+
+    .topbar {
+      display: flex;
+      gap: 12px;
+      align-items: center;
+      flex-wrap: wrap;
+      margin-bottom: 16px;
+    }
+
+    .stats {
+      margin: 12px 0;
+      padding: 10px 12px;
+      background: #f3f3f3;
+      border: 1px solid #ddd;
+      border-radius: 8px;
+      display: inline-block;
+    }
+
+    .layout {
+      display: grid;
+      grid-template-columns: 2fr 1fr;
+      gap: 16px;
+      align-items: start;
+    }
+
+    .panel {
+      border: 1px solid #ddd;
+      border-radius: 10px;
+      padding: 12px;
+      background: #fff;
+    }
+
+    #viewer {
+      width: 100%;
+      height: 700px;
+      border: 1px solid #ccc;
+      background: #fafafa;
+    }
+
+    table {
+      border-collapse: collapse;
+      width: 100%;
+      margin-top: 8px;
+      font-size: 14px;
+    }
+
+    th, td {
+      border: 1px solid #ddd;
+      padding: 6px 8px;
+      text-align: left;
+    }
+
+    th {
+      background: #f0f0f0;
+    }
+
+    .muted {
+      color: #666;
+      font-size: 13px;
+    }
+
+    .seat-info {
+      font-size: 14px;
+      line-height: 1.5;
+    }
+
+    .toolbar {
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+      margin: 8px 0 12px;
+    }
+
+    input[type="text"] {
+      padding: 6px 8px;
+      min-width: 180px;
+    }
+
+    button {
+      padding: 6px 10px;
+      cursor: pointer;
+    }
+
+    pre {
+      white-space: pre-wrap;
+      word-break: break-word;
+      background: #f7f7f7;
+      border: 1px solid #ddd;
+      padding: 10px;
+      border-radius: 8px;
+      max-height: 300px;
+      overflow: auto;
+    }
+  </style>
+</head>
+<body>
+  <h1>STMP Tools</h1>
+  <div class="muted">Local browser-based inspector for .stmp seatmap files</div>
+
+  <div class="topbar">
+    <input type="file" id="fileInput" accept=".stmp,.xml" />
+    <button id="exportJsonBtn" disabled>Export Summary JSON</button>
+  </div>
+
+  <div id="stats" class="stats">No file loaded.</div>
+
+  <div class="layout">
+    <div class="panel">
+      <div class="toolbar">
+        <input type="text" id="rowFilter" placeholder="Filter by row number" />
+        <input type="text" id="seatFilter" placeholder="Filter by seat number" />
+        <button id="applyFilterBtn" disabled>Apply Filter</button>
+        <button id="resetFilterBtn" disabled>Reset Filter</button>
+      </div>
+      <svg id="viewer" viewBox="0 0 1200 800"></svg>
+    </div>
+
+    <div class="panel">
+      <h3>Seat Inspector</h3>
+      <div id="seatInfo" class="seat-info">Click a seat in the map.</div>
+
+      <h3>Pages</h3>
+      <div id="pageTable">No data.</div>
+
+      <h3>Summary</h3>
+      <pre id="summaryBox">No data.</pre>
+    </div>
+  </div>
+
+  <script>
+    let currentData = null;
+    let currentFilteredSeats = [];
+    let selectedSeat = null;
+
+    const fileInput = document.getElementById("fileInput");
+    const stats = document.getElementById("stats");
+    const viewer = document.getElementById("viewer");
+    const seatInfo = document.getElementById("seatInfo");
+    const pageTable = document.getElementById("pageTable");
+    const summaryBox = document.getElementById("summaryBox");
+    const exportJsonBtn = document.getElementById("exportJsonBtn");
+    const applyFilterBtn = document.getElementById("applyFilterBtn");
+    const resetFilterBtn = document.getElementById("resetFilterBtn");
+    const rowFilter = document.getElementById("rowFilter");
+    const seatFilter = document.getElementById("seatFilter");
+
+    fileInput.addEventListener("change", async (e) => {
+      const file = e.target.files[0];
+      if (!file) return;
+
+      const text = await file.text();
+      loadStmp(text, file.name);
+    });
+
+    exportJsonBtn.addEventListener("click", () => {
+      if (!currentData) return;
+      const blob = new Blob([JSON.stringify(currentData.summary, null, 2)], { type: "application/json" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = "stmp-summary.json";
+      a.click();
+      URL.revokeObjectURL(url);
+    });
+
+    applyFilterBtn.addEventListener("click", () => {
+      if (!currentData) return;
+      applyFilters();
+    });
+
+    resetFilterBtn.addEventListener("click", () => {
+      rowFilter.value = "";
+      seatFilter.value = "";
+      if (!currentData) return;
+      currentFilteredSeats = [...currentData.seats];
+      renderSeats(currentFilteredSeats);
+      updateStats();
+    });
+
+    function loadStmp(text, fileName) {
+      const parser = new DOMParser();
+      const xml = parser.parseFromString(text, "application/xml");
+
+      const parseError = xml.querySelector("parsererror");
+      if (parseError) {
+        stats.textContent = "Invalid XML file.";
+        return;
+      }
+
+      const root = xml.querySelector("mfxseatmap");
+      const physical = xml.querySelector("physical");
+      const stable = xml.querySelector("stable");
+      const pages = Array.from(xml.querySelectorAll("physical pgs > np"));
+      const seats = Array.from(xml.querySelectorAll("physical s")).map((s, index) => ({
+        id: index + 1,
+        gx: parseFloat(s.getAttribute("gx") || "0"),
+        gy: parseFloat(s.getAttribute("gy") || "0"),
+        x: s.getAttribute("x") || "",
+        y: s.getAttribute("y") || "",
+        row: s.getAttribute("rn") || "",
+        seat: s.getAttribute("sn") || "",
+        level: s.getAttribute("le") || "",
+        section: s.getAttribute("se") || "",
+        pageName: findParentPageName(s),
+        raw: attributesToObject(s)
+      }));
+
+      const pageSummaries = pages.map((page) => {
+        const pageName = page.getAttribute("nm") || "";
+        const pageSeats = Array.from(page.querySelectorAll("s"));
+        return {
+          nr: page.getAttribute("nr") || "",
+          phid: page.getAttribute("phid") || "",
+          name: pageName,
+          seatCount: pageSeats.length
+        };
+      });
+
+      const locales = Array.from(xml.querySelectorAll("locs loc")).map(loc => loc.getAttribute("c")).filter(Boolean);
+      const levels = Array.from(xml.querySelectorAll("levl le")).map(le => ({
+        code: le.getAttribute("c") || "",
+        texts: Array.from(le.querySelectorAll("txt")).map(t => ({
+          loc: t.getAttribute("loc") || "",
+          text: t.getAttribute("t") || ""
+        }))
+      }));
+      const sections = Array.from(xml.querySelectorAll("secl se")).map(se => ({
+        code: se.getAttribute("c") || "",
+        texts: Array.from(se.querySelectorAll("txt")).map(t => ({
+          loc: t.getAttribute("loc") || "",
+          text: t.getAttribute("t") || ""
+        }))
+      }));
+
+      const summary = {
+        fileName,
+        rootTag: root ? root.tagName : null,
+        rootAttributes: root ? attributesToObject(root) : {},
+        hasPhysical: !!physical,
+        hasStable: !!stable,
+        physicalSeatCount: seats.length,
+        totalPageCount: pageSummaries.length,
+        locales,
+        levels,
+        sections,
+        pages: pageSummaries
+      };
+
+      currentData = {
+        xml,
+        seats,
+        pages: pageSummaries,
+        summary
+      };
+
+      currentFilteredSeats = [...seats];
+      selectedSeat = null;
+
+      renderSeats(currentFilteredSeats);
+      renderPages(pageSummaries);
+      updateStats();
+      summaryBox.textContent = JSON.stringify(summary, null, 2);
+
+      exportJsonBtn.disabled = false;
+      applyFilterBtn.disabled = false;
+      resetFilterBtn.disabled = false;
+    }
+
+    function findParentPageName(el) {
+      let node = el.parentElement;
+      while (node) {
+        if (node.tagName && node.tagName.toLowerCase() === "np") {
+          return node.getAttribute("nm") || "";
+        }
+        node = node.parentElement;
+      }
+      return "";
+    }
+
+    function attributesToObject(el) {
+      const out = {};
+      for (const attr of el.attributes) {
+        out[attr.name] = attr.value;
+      }
+      return out;
+    }
+
+    function applyFilters() {
+      const rowValue = rowFilter.value.trim();
+      const seatValue = seatFilter.value.trim();
+
+      currentFilteredSeats = currentData.seats.filter(seat => {
+        const rowOk = !rowValue || String(seat.row) === rowValue;
+        const seatOk = !seatValue || String(seat.seat) === seatValue;
+        return rowOk && seatOk;
+      });
+
+      renderSeats(currentFilteredSeats);
+      updateStats();
+    }
+
+    function updateStats() {
+      if (!currentData) {
+        stats.textContent = "No file loaded.";
+        return;
+      }
+
+      stats.textContent =
+        "Physical seats: " + currentData.seats.length +
+        " | Displayed: " + currentFilteredSeats.length +
+        " | Pages: " + currentData.pages.length;
+    }
+
+    function renderPages(pages) {
+      if (!pages.length) {
+        pageTable.innerHTML = "No pages found.";
+        return;
+      }
+
+      let html = "<table><thead><tr><th>Nr</th><th>Name</th><th>PHID</th><th>Seats</th></tr></thead><tbody>";
+      for (const p of pages) {
+        html += "<tr>" +
+          "<td>" + escapeHtml(p.nr) + "</td>" +
+          "<td>" + escapeHtml(p.name) + "</td>" +
+          "<td>" + escapeHtml(p.phid) + "</td>" +
+          "<td>" + escapeHtml(String(p.seatCount)) + "</td>" +
+          "</tr>";
+      }
+      html += "</tbody></table>";
+      pageTable.innerHTML = html;
+    }
+
+    function renderSeats(seats) {
+      viewer.innerHTML = "";
+
+      if (!seats.length) {
+        seatInfo.textContent = "No seats match the current filter.";
+        return;
+      }
+
+      const bounds = getBounds(seats);
+      const padding = 20;
+      const width = Math.max(100, bounds.maxX - bounds.minX + padding * 2);
+      const height = Math.max(100, bounds.maxY - bounds.minY + padding * 2);
+
+      viewer.setAttribute("viewBox", "0 0 " + width + " " + height);
+
+      for (const seat of seats) {
+        const cx = seat.gx - bounds.minX + padding;
+        const cy = seat.gy - bounds.minY + padding;
+
+        const g = document.createElementNS("http://www.w3.org/2000/svg", "g");
+
+        const circle = document.createElementNS("http://www.w3.org/2000/svg", "circle");
+        circle.setAttribute("cx", cx);
+        circle.setAttribute("cy", cy);
+        circle.setAttribute("r", 4);
+        circle.setAttribute("fill", selectedSeat && selectedSeat.id === seat.id ? "red" : "black");
+        circle.style.cursor = "pointer";
+
+        circle.addEventListener("click", () => {
+          selectedSeat = seat;
+          showSeatInfo(seat);
+          renderSeats(currentFilteredSeats);
+        });
+
+        g.appendChild(circle);
+        viewer.appendChild(g);
+      }
+    }
+
+    function showSeatInfo(seat) {
+      seatInfo.innerHTML =
+        "<strong>Seat</strong><br>" +
+        "Row: " + escapeHtml(seat.row) + "<br>" +
+        "Seat: " + escapeHtml(seat.seat) + "<br>" +
+        "Level: " + escapeHtml(seat.level) + "<br>" +
+        "Section: " + escapeHtml(seat.section) + "<br>" +
+        "Page: " + escapeHtml(seat.pageName) + "<br>" +
+        "gx/gy: " + escapeHtml(String(seat.gx)) + " / " + escapeHtml(String(seat.gy)) + "<br>" +
+        "x/y: " + escapeHtml(String(seat.x)) + " / " + escapeHtml(String(seat.y));
+    }
+
+    function getBounds(seats) {
+      let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+      for (const seat of seats) {
+        if (seat.gx < minX) minX = seat.gx;
+        if (seat.gy < minY) minY = seat.gy;
+        if (seat.gx > maxX) maxX = seat.gx;
+        if (seat.gy > maxY) maxY = seat.gy;
+      }
+      if (!isFinite(minX)) minX = 0;
+      if (!isFinite(minY)) minY = 0;
+      if (!isFinite(maxX)) maxX = 100;
+      if (!isFinite(maxY)) maxY = 100;
+      return { minX, minY, maxX, maxY };
+    }
+
+    function escapeHtml(value) {
+      return String(value)
+        .replaceAll("&", "&amp;")
+        .replaceAll("<", "&lt;")
+        .replaceAll(">", "&gt;")
+        .replaceAll('"', "&quot;")
+        .replaceAll("'", "&#039;");
+    }
+  </script>
+</body>
+</html>
